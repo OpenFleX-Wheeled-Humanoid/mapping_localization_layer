@@ -1,0 +1,41 @@
+imu_topic: /livox/imu
+lidar_topic: /livox/lidar
+# FAST-LIO2 发布 odom->base_link TF (通过 r_ib/t_ib 补偿到底盘中心)
+body_frame: base_link
+world_frame: odom
+print_time_cost: false
+
+# 室内场景参数 (实验室/仓库)
+lidar_filter_num: 3
+lidar_min_range: 0.5
+lidar_max_range: 20.0
+scan_resolution: 0.10
+map_resolution: 0.2
+
+cube_len: 200
+det_range: 30
+move_thresh: 0.5
+
+na: 0.01
+ng: 0.01
+nba: 0.0001
+nbg: 0.0001
+
+imu_init_num: 20
+near_search_num: 5
+ieskf_max_iter: 3
+
+gravity_align: true
+esti_il: false
+
+# Mid-360 出厂 LiDAR→IMU 外参
+r_il: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+t_il: [-0.011, -0.02329, 0.04412]
+
+# IMU body → base_link 外参 (URDF 中 base_link→mid360_link 的逆)
+# base_link→mid360_link: xyz=(0.28, 0, 0.12), rpy=(0, 0.5236, 0)
+# 逆变换: R_ib = Ry(-30deg), t_ib = -R^T * t
+r_ib: [0.8660254, 0.0, -0.5, 0.0, 1.0, 0.0, 0.5, 0.0, 0.8660254]
+t_ib: [-0.1824871, 0.0, -0.2439230]
+
+lidar_cov_inv: 1000.0

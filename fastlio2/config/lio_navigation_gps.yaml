@@ -1,0 +1,41 @@
+imu_topic: /livox/imu
+lidar_topic: /livox/lidar
+# GPS 模式: EKF 接管 TF 发布，FAST-LIO2 仅发 odom topic
+body_frame: base_link
+world_frame: odom
+print_time_cost: false
+publish_tf: false   # EKF 接管 odom->base_link TF
+
+# 导航档位（响应优先）
+lidar_filter_num: 3
+lidar_min_range: 0.5
+lidar_max_range: 20.0
+scan_resolution: 0.10
+map_resolution: 0.2
+
+cube_len: 200
+det_range: 30
+move_thresh: 0.5
+
+na: 0.01
+ng: 0.01
+nba: 0.0001
+nbg: 0.0001
+
+imu_init_num: 20
+near_search_num: 5
+ieskf_max_iter: 3
+
+gravity_align: true
+esti_il: false
+
+# Mid-360 出厂 LiDAR->IMU 外参
+r_il: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+t_il: [-0.011, -0.02329, 0.04412]
+
+# IMU body -> base_link 外参 (URDF 中 base_link->mid360_link 的逆)
+# base_link->mid360_link: xyz=(0.28, 0, 0.12), rpy=(0, 0.5236, 0)
+r_ib: [0.8660254, 0.0, -0.5, 0.0, 1.0, 0.0, 0.5, 0.0, 0.8660254]
+t_ib: [-0.1824871, 0.0, -0.2439230]
+
+lidar_cov_inv: 1000.0

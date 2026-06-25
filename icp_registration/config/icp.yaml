@@ -1,0 +1,65 @@
+/icp_registration:
+  ros__parameters:
+    use_sim_time: false
+    rough_leaf_size: 0.4
+    refine_leaf_size: 0.1
+    pcd_path: ""  # 运行时通过 launch 参数指定
+    map_frame_id: "map"
+    odom_frame_id: "odom"
+    base_frame_id: "base_link"
+    laser_frame_id: "base_link"
+    pointcloud_topic: "/livox/lidar"
+    # 初始全局定位仍用严格阈值；连续纠偏使用单独阈值。
+    # 日志中 continuous score≈0.89 时，thresh=0.5 会导致已收敛结果被丢弃。
+    thresh: 0.5
+    continuous_thresh: 1.2
+    # 初始搜索范围: 5x5 grid 间距 xy_offset, yaw 搜索 ±yaw_offset
+    xy_offset: 5.0
+    yaw_offset: 180.0
+    yaw_resolution: 30.0
+    # 启动后先等 FAST-LIVO 完成 IMU/LiDAR 自同步，再允许 SC/ICP 决定初始 map->odom。
+    # 日志里 2~4 秒内仍有 "IMU and LiDAR not synced"，过早初始化会把 ICP 锁到错误姿态。
+    initial_alignment_delay_sec: 8.0
+    # 周期性重定位间隔 (秒)，0 = 禁用。定位成功后按此间隔持续 ICP 纠偏
+    continuous_realign_interval_sec: 1.0
+    initial_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0] # x,y,z,roll,pitch,yaw
+    # ICP 迭代次数
+    rough_iter: 30
+    refine_iter: 20
+
+    # NDT 粗配准参数 (SC relocalization 用)
+    ndt_resolution: 1.0
+    ndt_step_size: 0.1
+    ndt_max_iterations: 30
+    ndt_epsilon: 0.01
+    ndt_score_thresh: 1.0
+
+    # SC relocalization 参数
+    submap_half_range: 5
+    sc_dist_thresh: 0.4
+
+    # GPS-assisted SC relocalization
+    gps_filter_radius: 20.0  # meters
+
+    # 地图裁剪: ICP 前只使用估计位置附近的地图点, 0.0=禁用
+    map_crop_radius: 50.0  # meters
+
+    # 导航使用平面定位, map→odom 只保留 x/y/yaw, 丢弃 z/roll/pitch
+    constrain_to_2d: true
+
+    # TF 平滑: map→odom 更新时插值过渡的时长, 0.0=禁用(立即跳变)
+    tf_smooth_duration: 0.0  # seconds
+
+    # LIO yaw jump detection: 用轮式里程计检测 FAST-LIO yaw 翻转
+    # 原理: LIO_yaw - wheel_yaw 的差值(divergence)应保持稳定
+    #        差值突变 > divergence_thresh 则判定 LIO 跳变
+    wheel_odom_topic: "/odom"
+    lio_jump_divergence_thresh: 0.35  # rad (~20°), divergence 变化超过此值视为跳变
+    lio_jump_icp_score_factor: 0.1   # ICP score < thresh * factor 才接受恢复
+    lio_jump_detection_timeout: 10.0 # seconds, 跳变标志超时自动清除
+    # 绝对 yaw 偏差检测: 校准 ICP_yaw - wheel_yaw 偏移量，当偏移量漂移超阈值时触发双路恢复
+    # 用于捕获 LIO 渐变漂移（逐帧 yaw_delta < 46° 但累计翻转 180°）的情况
+    icp_wheel_abs_yaw_thresh: 1.5    # rad (~86°), 偏移量漂移超过此值视为异常
+    icp_wheel_recovery_yaw_gate_thresh: 0.52  # rad (~30°), 跳变恢复必须接近轮式预测 yaw
+    wheel_odom_pose_timeout: 0.5      # seconds, 轮式里程计过旧时禁止用它判定恢复
+    localization_hold_topic: "/localization_hold"
