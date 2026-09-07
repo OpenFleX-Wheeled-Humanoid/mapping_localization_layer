@@ -48,7 +48,33 @@
     constrain_to_2d: true
 
     # TF 平滑: map→odom 更新时插值过渡的时长, 0.0=禁用(立即跳变)
-    tf_smooth_duration: 0.0  # seconds
+    # 改为 0.3~0.5 秒平滑过渡，避免 TF 跳变
+    tf_smooth_duration: 0.4  # seconds
+    pose_filter_alpha: 0.35   # EMA gain for continuous map->odom correction
+
+    # ========== 连续 ICP 严格验证参数 ==========
+    # 用于过滤错误的 ICP 结果，保留每秒修正漂移的能力
+
+    # 1. 单次修正量限制 (相邻两次 ICP 结果)
+    continuous_max_correction_xy: 0.3      # meters, 单次位置修正上限
+    continuous_max_correction_yaw: 0.26    # rad (~15°), 单次角度修正上限
+
+    # 2. ICP 质量判据
+    continuous_min_inlier_points: 100      # 有效匹配点数下限
+    continuous_max_rmse: 0.15              # meters, RMSE 上限
+    continuous_min_fitness_score: 0.95     # 适配度下限 (1.0=完美)
+
+    # 3. 连续一致性检查
+    continuous_consistency_window: 3       # 连续帧数，用于检查结果一致性
+    continuous_consistency_tolerance: 0.1  # meters, 连续帧位置差异容忍度
+
+    # 4. TF 时间戳严格模式
+    continuous_tf_lookup_strict: true      # true=TF查不到时跳过本次更新
+    continuous_tf_max_extrapolation: 0.1   # seconds, 允许的最大外推时间
+
+    # 5. 连续失败保护
+    continuous_max_consecutive_rejects: 5  # 连续拒绝次数上限
+    # 超过上限后保持最后有效位姿，不触发全局 Scan Context
 
     # LIO yaw jump detection: 用轮式里程计检测 FAST-LIO yaw 翻转
     # 原理: LIO_yaw - wheel_yaw 的差值(divergence)应保持稳定

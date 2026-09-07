@@ -9,7 +9,9 @@
     world_frame: odom
     odom_frame: odom
     body_frame: base_link
-    publish_tf: true
+    # odom -> base_link is owned by swerve_navigation/safe_odom_mux so LIO
+    # and wheel odometry can be arbitrated without duplicate TF publishers.
+    publish_tf: false
     publish_map_odom: false
     freeze_map_odom_when_static: true
     static_linear_thresh: 0.01

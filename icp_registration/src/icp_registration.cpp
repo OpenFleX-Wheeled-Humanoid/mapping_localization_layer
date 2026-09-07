@@ -172,6 +172,8 @@ IcpNode::IcpNode(const rclcpp::NodeOptions &options)
       this->declare_parameter("min_points_for_alignment", 200));
   map_crop_radius_ = this->declare_parameter("map_crop_radius", 50.0);
   tf_smooth_duration_ = this->declare_parameter("tf_smooth_duration", 0.5);
+  pose_filter_alpha_ = this->declare_parameter("pose_filter_alpha", 0.35);
+  pose_filter_ = PlanarPoseFilter(pose_filter_alpha_);
   constrain_to_2d_ = this->declare_parameter("constrain_to_2d", true);
   tf_smooth_start_time_ = rclcpp::Time(0, 0, this->get_clock()->get_clock_type());
   std::vector<double> initial_pose_vec = this->declare_parameter(
@@ -207,6 +209,37 @@ IcpNode::IcpNode(const rclcpp::NodeOptions &options)
 
   // SC body frame: the frame used during mapping (mid360_link by default)
   sc_body_frame_ = this->declare_parameter("sc_body_frame", std::string("mid360_link"));
+
+  // ========== 连续 ICP 严格验证参数 ==========
+  continuous_max_correction_xy_ =
+      this->declare_parameter("continuous_max_correction_xy", 0.3);
+  continuous_max_correction_yaw_ =
+      this->declare_parameter("continuous_max_correction_yaw", 0.26);
+  continuous_min_inlier_points_ = static_cast<size_t>(
+      this->declare_parameter("continuous_min_inlier_points", 100));
+  continuous_max_rmse_ =
+      this->declare_parameter("continuous_max_rmse", 0.15);
+  continuous_min_fitness_score_ =
+      this->declare_parameter("continuous_min_fitness_score", 0.95);
+  continuous_consistency_window_ =
+      this->declare_parameter("continuous_consistency_window", 3);
+  continuous_consistency_tolerance_ =
+      this->declare_parameter("continuous_consistency_tolerance", 0.1);
+  continuous_tf_lookup_strict_ =
+      this->declare_parameter("continuous_tf_lookup_strict", true);
+  continuous_tf_max_extrapolation_ =
+      this->declare_parameter("continuous_tf_max_extrapolation", 0.1);
+  continuous_max_consecutive_rejects_ =
+      this->declare_parameter("continuous_max_consecutive_rejects", 5);
+
+  RCLCPP_INFO(this->get_logger(),
+      "Continuous ICP validation: max_xy=%.2fm, max_yaw=%.1f°, "
+      "min_points=%zu, max_rmse=%.3fm, consistency_window=%d",
+      continuous_max_correction_xy_,
+      continuous_max_correction_yaw_ * 180.0 / M_PI,
+      continuous_min_inlier_points_,
+      continuous_max_rmse_,
+      continuous_consistency_window_);
 
   // Initialize NDT
   ndt_.setResolution(ndt_resolution_);
@@ -446,8 +479,22 @@ geometry_msgs::msg::Pose IcpNode::projectPoseToPlane(
 void IcpNode::updateMapToOdom(const Eigen::Matrix4d &new_transform, bool force_snap) {
   std::lock_guard lock(mutex_);
 
-  const Eigen::Matrix4d constrained_transform =
-      projectTransformToPlane(new_transform);
+  Eigen::Matrix4d constrained_transform = projectTransformToPlane(new_transform);
+
+  const double measured_yaw = std::atan2(
+      constrained_transform(1, 0), constrained_transform(0, 0));
+  const PlanarPose measured_pose{
+      constrained_transform(0, 3), constrained_transform(1, 3), measured_yaw};
+  if (force_snap || !initial_localization_done_ || !pose_filter_.initialized()) {
+    pose_filter_.reset(measured_pose);
+  } else {
+    const PlanarPose filtered_pose = pose_filter_.update(measured_pose);
+    constrained_transform(0, 3) = filtered_pose.x;
+    constrained_transform(1, 3) = filtered_pose.y;
+    constrained_transform.block<3, 3>(0, 0) =
+        Eigen::AngleAxisd(filtered_pose.yaw, Eigen::Vector3d::UnitZ())
+            .toRotationMatrix();
+  }
 
   // Build the new transform message
   Eigen::Quaterniond q_new(constrained_transform.block<3, 3>(0, 0));
@@ -1733,9 +1780,16 @@ fallback:
       // Don't clear is_ready_ on continuous failure — keep last good pose
       RCLCPP_WARN(this->get_logger(),
                   "Continuous ICP did not converge, keeping last good pose");
+      continuous_reject_streak_++;
+      if (continuous_reject_streak_ >= continuous_max_consecutive_rejects_) {
+        RCLCPP_ERROR(this->get_logger(),
+                     "Continuous ICP failed %d times in a row, but keeping last pose (NOT triggering SC)",
+                     continuous_reject_streak_);
+      }
       return;
     }
     map_to_laser = icp_refine_.getFinalTransformation().cast<double>();
+
   } else {
     // Initial alignment: full grid-search
     RCLCPP_INFO(this->get_logger(), "Aligning the pointcloud");
@@ -1781,6 +1835,50 @@ fallback:
     return;
   }
   Eigen::Matrix4d result = map_to_laser * laser_to_odom;
+
+  // Continuous ICP results must pass the same gates before they can alter
+  // map->odom.  The TF conversion above is required to form the correction.
+  if (skip_sc && initial_localization_done_) {
+    IcpResult icp_result;
+    icp_result.converged = icp_refine_.hasConverged();
+    icp_result.score = score_;
+    icp_result.map_to_laser = map_to_laser;
+
+    Eigen::Matrix4d result_old = Eigen::Matrix4d::Identity();
+    {
+      std::lock_guard lock(mutex_);
+      Eigen::Quaterniond q_old(
+          map_to_odom_.transform.rotation.w,
+          map_to_odom_.transform.rotation.x,
+          map_to_odom_.transform.rotation.y,
+          map_to_odom_.transform.rotation.z);
+      result_old.block<3, 3>(0, 0) = q_old.toRotationMatrix();
+      result_old(0, 3) = map_to_odom_.transform.translation.x;
+      result_old(1, 3) = map_to_odom_.transform.translation.y;
+      result_old(2, 3) = map_to_odom_.transform.translation.z;
+    }
+
+    std::string reject_reason;
+    if (!validateContinuousIcpResult(
+            icp_result, result_old, result, scan_stamp, reject_reason)) {
+      RCLCPP_WARN(this->get_logger(),
+                  "Continuous ICP REJECTED by strict validation: %s",
+                  reject_reason.c_str());
+      ++continuous_reject_streak_;
+      return;
+    }
+
+    const Eigen::Vector3d current_pose(
+        map_to_laser(0, 3), map_to_laser(1, 3),
+        std::atan2(map_to_laser(1, 0), map_to_laser(0, 0)));
+    recent_icp_poses_.push_back(current_pose);
+    if (recent_icp_poses_.size() >
+        static_cast<size_t>(continuous_consistency_window_)) {
+      recent_icp_poses_.pop_front();
+    }
+    continuous_reject_streak_ = 0;
+    RCLCPP_INFO(this->get_logger(), "Continuous ICP ACCEPTED by strict validation");
+  }
 
   // Sanity check: reject continuous ICP results that produce unreasonably
   // large corrections.  Compare the NEW map→base_link pose against the
@@ -2173,6 +2271,101 @@ Eigen::Matrix4d IcpNode::multiAlignSync(PointCloudXYZI::Ptr source,
   RCLCPP_INFO(this->get_logger(), "score: %f", score_);
 
   return icp_refine_.getFinalTransformation().cast<double>();
+}
+
+// ========== 连续 ICP 严格验证函数实现 ==========
+bool IcpNode::validateContinuousIcpResult(
+    const IcpResult &result,
+    const Eigen::Matrix4d &map_to_odom_old,
+    const Eigen::Matrix4d &map_to_odom_new,
+    const rclcpp::Time &scan_stamp,
+    std::string &reject_reason) {
+
+  // 0. 基础收敛检查
+  if (!result.converged) {
+    reject_reason = "ICP not converged";
+    return false;
+  }
+
+  // 1. 检查 fitness score (越小越好，但我们设置的是最小值，表示质量下限)
+  // 注意：PCL的getFitnessScore()返回的是平均距离平方，不是0-1的适配度
+  // 这里continuous_min_fitness_score_实际上是一个阈值，而不是百分比
+  // 我们应该检查score是否低于阈值
+  if (result.score > continuous_max_rmse_) {
+    reject_reason = "RMSE too high: " + std::to_string(result.score) +
+                    " > " + std::to_string(continuous_max_rmse_);
+    return false;
+  }
+
+  // 2. 计算 map→odom 的修正量
+  Eigen::Vector3d trans_old(map_to_odom_old(0, 3), map_to_odom_old(1, 3), map_to_odom_old(2, 3));
+  Eigen::Vector3d trans_new(map_to_odom_new(0, 3), map_to_odom_new(1, 3), map_to_odom_new(2, 3));
+  double correction_xy = (trans_new - trans_old).head<2>().norm();
+
+  double yaw_old = std::atan2(map_to_odom_old(1, 0), map_to_odom_old(0, 0));
+  double yaw_new = std::atan2(map_to_odom_new(1, 0), map_to_odom_new(0, 0));
+  double correction_yaw = std::abs(yaw_new - yaw_old);
+  if (correction_yaw > M_PI) {
+    correction_yaw = 2.0 * M_PI - correction_yaw;
+  }
+
+  // 检查单次修正量
+  if (correction_xy > continuous_max_correction_xy_) {
+    reject_reason = "XY correction too large: " + std::to_string(correction_xy) +
+                    "m > " + std::to_string(continuous_max_correction_xy_) + "m";
+    return false;
+  }
+
+  if (correction_yaw > continuous_max_correction_yaw_) {
+    reject_reason = "Yaw correction too large: " +
+                    std::to_string(correction_yaw * 180.0 / M_PI) + "° > " +
+                    std::to_string(continuous_max_correction_yaw_ * 180.0 / M_PI) + "°";
+    return false;
+  }
+
+  // 3. 连续一致性检查
+  Eigen::Vector3d current_pose(trans_new.x(), trans_new.y(), yaw_new);
+
+  if (recent_icp_poses_.size() >= static_cast<size_t>(continuous_consistency_window_)) {
+    // 检查与最近N帧的一致性
+    double max_deviation = 0.0;
+    for (const auto &prev_pose : recent_icp_poses_) {
+      double xy_diff = (current_pose.head<2>() - prev_pose.head<2>()).norm();
+      max_deviation = std::max(max_deviation, xy_diff);
+    }
+
+    if (max_deviation > continuous_consistency_tolerance_) {
+      reject_reason = "Consistency check failed: max_deviation=" +
+                      std::to_string(max_deviation) + "m > " +
+                      std::to_string(continuous_consistency_tolerance_) + "m";
+      return false;
+    }
+  }
+
+  // 4. TF 时间戳严格模式检查
+  if (continuous_tf_lookup_strict_) {
+    try {
+      // 尝试精确查找该时间戳的TF
+      auto tf_test = tf_buffer_->lookupTransform(
+          odom_frame_id_, base_frame_id_,
+          scan_stamp,
+          rclcpp::Duration::from_seconds(continuous_tf_max_extrapolation_));
+
+      // 检查TF时间差
+      double tf_age = std::abs((rclcpp::Time(tf_test.header.stamp) - scan_stamp).seconds());
+      if (tf_age > continuous_tf_max_extrapolation_) {
+        reject_reason = "TF extrapolation too large: " + std::to_string(tf_age) +
+                        "s > " + std::to_string(continuous_tf_max_extrapolation_) + "s";
+        return false;
+      }
+    } catch (tf2::TransformException &ex) {
+      reject_reason = std::string("TF lookup failed (strict mode): ") + ex.what();
+      return false;
+    }
+  }
+
+  // 所有检查通过
+  return true;
 }
 
 } // namespace icp

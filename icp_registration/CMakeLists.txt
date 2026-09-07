@@ -34,6 +34,12 @@ rclcpp_components_register_node(${PROJECT_NAME}
 )
 
 if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_planar_pose_filter
+    test/test_planar_pose_filter.cpp)
+  target_include_directories(test_planar_pose_filter PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
   find_package(ament_lint_auto REQUIRED)
   set(ament_cmake_copyright_FOUND TRUE)
   set(ament_cmake_cpplint_FOUND TRUE)

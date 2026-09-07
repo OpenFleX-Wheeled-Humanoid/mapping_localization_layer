@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <deque>
 
 // ros
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
@@ -21,6 +22,8 @@
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
+
+#include "icp_registration/planar_pose_filter.hpp"
 
 
 // pcl
@@ -186,6 +189,8 @@ private:
   double tf_smooth_duration_;
   bool tf_smoothing_active_;
   bool initial_localization_done_;
+  double pose_filter_alpha_ = 0.35;
+  PlanarPoseFilter pose_filter_{pose_filter_alpha_};
 
   // SC fallback: when SC matches a keyframe but NDT/ICP fails,
   // pass the keyframe pose to grid-search as a better initial guess
@@ -242,6 +247,39 @@ private:
   double icp_wheel_abs_yaw_thresh_ = 1.5;    // rad (~86°), trigger dual-ICP if exceeded
   double icp_wheel_recovery_yaw_gate_thresh_ = 0.52;  // rad (~30°)
   double wheel_odom_pose_timeout_ = 0.5;  // seconds
+
+  // ========== 连续 ICP 严格验证参数 ==========
+  // 用于过滤错误的 ICP 结果，保留每秒修正漂移的能力
+
+  // 1. 单次修正量限制
+  double continuous_max_correction_xy_ = 0.3;      // meters
+  double continuous_max_correction_yaw_ = 0.26;    // rad (~15°)
+
+  // 2. ICP 质量判据
+  size_t continuous_min_inlier_points_ = 100;      // 有效匹配点数
+  double continuous_max_rmse_ = 0.15;              // meters
+  double continuous_min_fitness_score_ = 0.95;     // 适配度 (越接近1越好)
+
+  // 3. 连续一致性检查
+  int continuous_consistency_window_ = 3;          // 连续帧数
+  double continuous_consistency_tolerance_ = 0.1;   // meters
+  std::deque<Eigen::Vector3d> recent_icp_poses_;   // 最近N次ICP位姿 (x, y, yaw)
+
+  // 4. TF 时间戳严格模式
+  bool continuous_tf_lookup_strict_ = true;        // TF查不到时跳过
+  double continuous_tf_max_extrapolation_ = 0.1;   // seconds
+
+  // 5. 连续失败保护
+  int continuous_max_consecutive_rejects_ = 5;     // 连续拒绝次数上限
+  int continuous_reject_streak_ = 0;               // 当前连续拒绝计数
+
+  // 验证辅助函数
+  bool validateContinuousIcpResult(
+      const IcpResult &result,
+      const Eigen::Matrix4d &map_to_odom_old,
+      const Eigen::Matrix4d &map_to_odom_new,
+      const rclcpp::Time &scan_stamp,
+      std::string &reject_reason);
 };
 } // namespace icp
 #endif
