@@ -1,0 +1,1074 @@
+#!/usr/bin/env python3
+import math
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+from pathlib import Path
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+try:
+    from ament_index_python.packages import get_package_prefix
+except Exception:
+    get_package_prefix = None
+
+
+PREVIEW_MAX_SIZE = 720
+PREVIEW_ZOOM_CAP = 6
+UNKNOWN_VALUE = 205
+FREE_VALUE = 254
+OCCUPIED_VALUE = 0
+MODE_TO_PIXEL = {
+    'occupied': OCCUPIED_VALUE,
+    'free': FREE_VALUE,
+    'unknown': UNKNOWN_VALUE,
+}
+MODE_TO_LABEL = {
+    'occupied': '障碍',
+    'free': '自由',
+    'unknown': '未知',
+}
+TOOL_TO_LABEL = {
+    'brush': '画笔',
+    'line': '直线',
+}
+MODE_TO_COLOR = {
+    'occupied': '#000000',
+    'free': '#ffffff',
+    'unknown': '#bdbdbd',
+}
+
+
+def resolve_converter_path() -> Path:
+    sibling = Path(__file__).resolve().with_name('pcd_to_nav2_map')
+    if sibling.is_file():
+        return sibling
+
+    if get_package_prefix is not None:
+        try:
+            prefix = Path(get_package_prefix('pgo'))
+            candidate = prefix / 'lib' / 'pgo' / 'pcd_to_nav2_map'
+            if candidate.is_file():
+                return candidate
+        except Exception:
+            pass
+
+    try:
+        proc = subprocess.run(
+            ['ros2', 'pkg', 'prefix', 'pgo'],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        prefix = Path(proc.stdout.strip())
+        candidate = prefix / 'lib' / 'pgo' / 'pcd_to_nav2_map'
+        if candidate.is_file():
+            return candidate
+    except Exception:
+        pass
+
+    raise FileNotFoundError(
+        '无法找到 pcd_to_nav2_map 可执行程序，请先 colcon build 并 source install/setup.bash'
+    )
+
+
+def clone_pixels(pixels: list[list[int]]) -> list[list[int]]:
+    return [row[:] for row in pixels]
+
+
+def pixel_to_mode(value: int) -> str:
+    if value <= 50:
+        return 'occupied'
+    if value >= 250:
+        return 'free'
+    return 'unknown'
+
+
+def pixel_to_color(value: int) -> str:
+    return MODE_TO_COLOR[pixel_to_mode(value)]
+
+
+def normalize_pixel(value: int) -> int:
+    return MODE_TO_PIXEL[pixel_to_mode(int(value))]
+
+
+def next_pgm_token(data: bytes, index: int) -> tuple[bytes, int]:
+    length = len(data)
+    while index < length:
+        byte = data[index]
+        if chr(byte).isspace():
+            index += 1
+            continue
+        if byte == ord('#'):
+            while index < length and data[index] not in (10, 13):
+                index += 1
+            continue
+        break
+
+    start = index
+    while index < length and not chr(data[index]).isspace():
+        index += 1
+    return data[start:index], index
+
+
+def read_pgm(path: Path) -> tuple[int, int, list[list[int]]]:
+    data = path.read_bytes()
+    token, index = next_pgm_token(data, 0)
+    if token not in (b'P5', b'P2'):
+        raise ValueError(f'不支持的 PGM 格式: {token!r}')
+    magic = token
+
+    token, index = next_pgm_token(data, index)
+    width = int(token)
+    token, index = next_pgm_token(data, index)
+    height = int(token)
+    token, index = next_pgm_token(data, index)
+    max_value = int(token)
+    if max_value > 255:
+        raise ValueError('当前 GUI 只支持 8-bit PGM')
+
+    if magic == b'P5':
+        while index < len(data) and chr(data[index]).isspace():
+            index += 1
+        raster = data[index:index + width * height]
+        if len(raster) != width * height:
+            raise ValueError('PGM 数据长度不正确')
+        rows = []
+        for y in range(height):
+            start = y * width
+            rows.append(list(raster[start:start + width]))
+        return width, height, rows
+
+    values: list[int] = []
+    while True:
+        token, index = next_pgm_token(data, index)
+        if not token:
+            break
+        values.append(int(token))
+    if len(values) != width * height:
+        raise ValueError('P2 PGM 数据长度不正确')
+    rows = []
+    for y in range(height):
+        start = y * width
+        rows.append(values[start:start + width])
+    return width, height, rows
+
+
+def write_pgm(path: Path, pixels: list[list[int]]) -> None:
+    if not pixels or not pixels[0]:
+        raise ValueError('没有可保存的像素数据')
+    height = len(pixels)
+    width = len(pixels[0])
+    with path.open('wb') as handle:
+        handle.write(b'P5\n')
+        handle.write(b'# CREATOR: pcd_to_nav2_map_gui\n')
+        handle.write(f'{width} {height}\n255\n'.encode('ascii'))
+        for row in pixels:
+            handle.write(bytes(normalize_pixel(value) for value in row))
+
+
+class MapConverterGui:
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self.root.title('PCD 到 2D 地图生成器')
+        self.root.geometry('1460x920')
+        self.root.minsize(1240, 780)
+
+        self.converter_path = resolve_converter_path()
+        self.preview_root = Path(tempfile.mkdtemp(prefix='pcd_to_nav2_map_gui_'))
+        self.preview_dir = self.preview_root / 'preview'
+
+        self.worker_thread: threading.Thread | None = None
+        self.running = False
+        self.current_pixels: list[list[int]] | None = None
+        self.original_pixels: list[list[int]] | None = None
+        self.current_width = 0
+        self.current_height = 0
+        self.current_yaml_text = ''
+        self.current_yaml_path: Path | None = None
+        self.current_image_path: Path | None = None
+        self.current_resolution: float | None = None
+        self.current_origin: tuple[float, float, float] | None = None
+        self.is_dirty = False
+        self.display_zoom = 1
+        self.display_subsample = 1
+        self.base_photo: tk.PhotoImage | None = None
+        self.display_photo: tk.PhotoImage | None = None
+        self.canvas_image_id: int | None = None
+        self.last_paint_key: tuple[int, int, int, str] | None = None
+
+        self.pcd_path_var = tk.StringVar()
+        self.output_dir_var = tk.StringVar()
+        self.poses_path_var = tk.StringVar()
+        self.use_poses_var = tk.BooleanVar(value=True)
+        self.draw_tool_var = tk.StringVar(value='brush')
+        self.edit_mode_var = tk.StringVar(value='occupied')
+        self.brush_radius_var = tk.StringVar(value='2')
+        self.line_start_cell: tuple[int, int] | None = None
+        self.preview_line_id: int | None = None
+
+        self.param_vars = {
+            'resolution': tk.StringVar(value='0.05'),
+            'z_min': tk.StringVar(value='0.00'),
+            'z_max': tk.StringVar(value='2.30'),
+            'obstacle_z_min': tk.StringVar(value='0.10'),
+            'obstacle_z_max': tk.StringVar(value='1.40'),
+            'inflation_radius': tk.StringVar(value='0.0'),
+            'padding': tk.StringVar(value='0.30'),
+            'obstacle_min_hits': tk.StringVar(value='3'),
+            'sor_mean_k': tk.StringVar(value='24'),
+            'sor_stddev': tk.StringVar(value='1.0'),
+            'min_obstacle_cluster': tk.StringVar(value='8'),
+        }
+
+        self.status_var = tk.StringVar(value=f'转换器: {self.converter_path}')
+        self.preview_info_var = tk.StringVar(value='还没有预览。')
+        self.cursor_info_var = tk.StringVar(value='光标: -')
+
+        self._build_ui()
+        self.draw_tool_var.trace_add('write', self._on_edit_settings_change)
+        self.edit_mode_var.trace_add('write', self._on_edit_settings_change)
+        self.brush_radius_var.trace_add('write', self._on_edit_settings_change)
+        self.root.protocol('WM_DELETE_WINDOW', self._on_close)
+
+    def _build_ui(self) -> None:
+        self.root.columnconfigure(1, weight=1)
+        self.root.rowconfigure(0, weight=1)
+
+        left = ttk.Frame(self.root, padding=10)
+        left.grid(row=0, column=0, sticky='nsw')
+        left.columnconfigure(0, weight=1)
+
+        right = ttk.Frame(self.root, padding=(0, 10, 10, 10))
+        right.grid(row=0, column=1, sticky='nsew')
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(1, weight=1)
+        right.rowconfigure(4, weight=1)
+
+        self._build_inputs(left)
+        self._build_parameters(left)
+        self._build_actions(left)
+        self._build_edit_tools(left)
+
+        ttk.Label(right, text='预览 / 修图').grid(row=0, column=0, sticky='w', padx=4, pady=(0, 4))
+        preview_frame = ttk.Frame(right)
+        preview_frame.grid(row=1, column=0, sticky='nsew')
+        preview_frame.columnconfigure(0, weight=1)
+        preview_frame.rowconfigure(0, weight=1)
+
+        self.preview_canvas = tk.Canvas(preview_frame, background='#2b2b2b', highlightthickness=1)
+        self.preview_canvas.grid(row=0, column=0, sticky='nsew')
+        self.preview_canvas.bind('<Button-1>', self._on_paint_start)
+        self.preview_canvas.bind('<B1-Motion>', self._on_paint_drag)
+        self.preview_canvas.bind('<ButtonRelease-1>', self._on_paint_end)
+        self.preview_canvas.bind('<Button-3>', self._on_cancel_line)
+        self.preview_canvas.bind('<Motion>', self._on_canvas_motion)
+        self.preview_canvas.bind('<Leave>', self._on_canvas_leave)
+        self.preview_canvas.create_text(
+            PREVIEW_MAX_SIZE // 2,
+            PREVIEW_MAX_SIZE // 2,
+            text='点击“预览生成”后在这里显示并编辑 map.pgm',
+            fill='#dddddd',
+        )
+
+        ttk.Label(right, textvariable=self.preview_info_var, justify='left').grid(
+            row=2, column=0, sticky='we', padx=4, pady=(6, 2)
+        )
+        ttk.Label(right, textvariable=self.cursor_info_var, justify='left').grid(
+            row=3, column=0, sticky='we', padx=4, pady=(0, 8)
+        )
+
+        ttk.Label(right, text='运行日志').grid(row=4, column=0, sticky='nw', padx=4)
+        log_frame = ttk.Frame(right)
+        log_frame.grid(row=5, column=0, sticky='nsew')
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+        right.rowconfigure(5, weight=1)
+
+        self.log_text = tk.Text(log_frame, wrap='word', height=14)
+        self.log_text.grid(row=0, column=0, sticky='nsew')
+        log_scroll = ttk.Scrollbar(log_frame, orient='vertical', command=self.log_text.yview)
+        log_scroll.grid(row=0, column=1, sticky='ns')
+        self.log_text.configure(yscrollcommand=log_scroll.set)
+        self.log_text.configure(state='disabled')
+
+        status = ttk.Label(self.root, textvariable=self.status_var, anchor='w', relief='sunken')
+        status.grid(row=1, column=0, columnspan=2, sticky='ew')
+
+    def _build_inputs(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text='输入')
+        frame.grid(row=0, column=0, sticky='ew', pady=(0, 10))
+        frame.columnconfigure(1, weight=1)
+
+        self._path_row(frame, 0, 'PCD 文件', self.pcd_path_var, self._browse_pcd)
+        self._path_row(frame, 1, 'Pose 文件', self.poses_path_var, self._browse_poses)
+        self._path_row(frame, 2, '输出目录', self.output_dir_var, self._browse_output_dir)
+
+        ttk.Checkbutton(
+            frame,
+            text='启用 poses 射线自由空间投影',
+            variable=self.use_poses_var,
+        ).grid(row=3, column=0, columnspan=3, sticky='w', padx=8, pady=(2, 8))
+
+    def _path_row(self, frame: ttk.LabelFrame, row: int, text: str, var: tk.StringVar, command) -> None:
+        ttk.Label(frame, text=text).grid(row=row, column=0, sticky='w', padx=8, pady=6)
+        ttk.Entry(frame, textvariable=var, width=42).grid(row=row, column=1, sticky='ew', padx=4, pady=6)
+        ttk.Button(frame, text='浏览', command=command).grid(row=row, column=2, sticky='e', padx=8, pady=6)
+
+    def _build_parameters(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text='参数')
+        frame.grid(row=1, column=0, sticky='ew', pady=(0, 10))
+        frame.columnconfigure(1, weight=1)
+        frame.columnconfigure(3, weight=1)
+
+        rows = [
+            ('resolution', '分辨率 (m)'),
+            ('z_min', '观测最小 Z'),
+            ('z_max', '观测最大 Z'),
+            ('obstacle_z_min', '障碍最小 Z'),
+            ('obstacle_z_max', '障碍最大 Z'),
+            ('inflation_radius', '生成图膨胀半径'),
+            ('padding', '边界补边 (m)'),
+            ('obstacle_min_hits', '障碍最小命中数'),
+            ('sor_mean_k', 'SOR 邻居数'),
+            ('sor_stddev', 'SOR 标准差阈值'),
+            ('min_obstacle_cluster', '最小障碍团簇'),
+        ]
+        for idx, (key, label) in enumerate(rows):
+            col = 0 if idx < 6 else 2
+            row = idx if idx < 6 else idx - 6
+            ttk.Label(frame, text=label).grid(row=row, column=col, sticky='w', padx=8, pady=5)
+            ttk.Entry(frame, textvariable=self.param_vars[key], width=14).grid(
+                row=row, column=col + 1, sticky='ew', padx=4, pady=5
+            )
+
+    def _build_actions(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text='生成 / 保存')
+        frame.grid(row=2, column=0, sticky='ew', pady=(0, 10))
+        frame.columnconfigure(0, weight=1)
+
+        self.preview_button = ttk.Button(frame, text='预览生成', command=self._preview_generate)
+        self.preview_button.grid(row=0, column=0, sticky='ew', padx=8, pady=(8, 4))
+
+        self.save_button = ttk.Button(frame, text='生成并保存到输出目录', command=self._save_generate)
+        self.save_button.grid(row=1, column=0, sticky='ew', padx=8, pady=4)
+
+        self.save_edit_button = ttk.Button(
+            frame,
+            text='保存当前编辑到输出目录',
+            command=self._save_current_map_to_output,
+            state='disabled',
+        )
+        self.save_edit_button.grid(row=2, column=0, sticky='ew', padx=8, pady=4)
+
+        self.restore_button = ttk.Button(
+            frame,
+            text='恢复到本次生成结果',
+            command=self._restore_original_map,
+            state='disabled',
+        )
+        self.restore_button.grid(row=3, column=0, sticky='ew', padx=8, pady=4)
+
+        ttk.Button(frame, text='打开输出目录', command=self._open_output_dir).grid(
+            row=4, column=0, sticky='ew', padx=8, pady=4
+        )
+        ttk.Button(frame, text='清空日志', command=self._clear_log).grid(
+            row=5, column=0, sticky='ew', padx=8, pady=(4, 8)
+        )
+
+    def _build_edit_tools(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text='修图')
+        frame.grid(row=3, column=0, sticky='ew')
+        frame.columnconfigure(1, weight=1)
+
+        ttk.Label(frame, text='工具').grid(row=0, column=0, sticky='w', padx=8, pady=(8, 4))
+        tools = ttk.Frame(frame)
+        tools.grid(row=0, column=1, sticky='w', padx=4, pady=(8, 4))
+        for idx, key in enumerate(('brush', 'line')):
+            ttk.Radiobutton(
+                tools,
+                text=TOOL_TO_LABEL[key],
+                variable=self.draw_tool_var,
+                value=key,
+            ).grid(row=0, column=idx, sticky='w', padx=(0, 8))
+
+        ttk.Label(frame, text='刷子').grid(row=1, column=0, sticky='w', padx=8, pady=4)
+        modes = ttk.Frame(frame)
+        modes.grid(row=1, column=1, sticky='w', padx=4, pady=4)
+        for idx, key in enumerate(('occupied', 'free', 'unknown')):
+            ttk.Radiobutton(
+                modes,
+                text=MODE_TO_LABEL[key],
+                variable=self.edit_mode_var,
+                value=key,
+            ).grid(row=0, column=idx, sticky='w', padx=(0, 8))
+
+        ttk.Label(frame, text='半径 (格)').grid(row=2, column=0, sticky='w', padx=8, pady=4)
+        radius_controls = ttk.Frame(frame)
+        radius_controls.grid(row=2, column=1, sticky='w', padx=4, pady=4)
+        ttk.Button(radius_controls, text='-', width=3, command=lambda: self._step_brush_radius(-1)).grid(
+            row=0, column=0, padx=(0, 4)
+        )
+        radius_entry = ttk.Entry(radius_controls, textvariable=self.brush_radius_var, width=8)
+        radius_entry.grid(row=0, column=1, padx=(0, 4))
+        ttk.Button(radius_controls, text='+', width=3, command=lambda: self._step_brush_radius(1)).grid(
+            row=0, column=2
+        )
+        radius_entry.bind('<FocusOut>', self._normalize_brush_radius)
+        radius_entry.bind('<Return>', self._normalize_brush_radius)
+
+        hint = (
+            '画笔: 左键拖动直接修图。\n'
+            '直线: 左键第一次定起点，第二次落点成线，右键取消。\n'
+            '线宽沿用半径，填充内容沿用上方障碍 / 自由 / 未知。'
+        )
+        ttk.Label(frame, text=hint, justify='left').grid(
+            row=3, column=0, columnspan=2, sticky='w', padx=8, pady=(4, 8)
+        )
+
+    def _browse_pcd(self) -> None:
+        path = filedialog.askopenfilename(
+            title='选择 PCD 文件',
+            filetypes=[('PCD 文件', '*.pcd'), ('所有文件', '*.*')],
+        )
+        if path:
+            self.pcd_path_var.set(path)
+            self._autofill_related_paths(Path(path))
+
+    def _browse_poses(self) -> None:
+        path = filedialog.askopenfilename(
+            title='选择 poses.txt',
+            filetypes=[('文本文件', '*.txt'), ('所有文件', '*.*')],
+        )
+        if path:
+            self.poses_path_var.set(path)
+            self.use_poses_var.set(True)
+
+    def _browse_output_dir(self) -> None:
+        path = filedialog.askdirectory(title='选择输出目录')
+        if path:
+            self.output_dir_var.set(path)
+
+    def _autofill_related_paths(self, pcd_path: Path) -> None:
+        poses = pcd_path.with_name('poses.txt')
+        if poses.is_file() and not self.poses_path_var.get():
+            self.poses_path_var.set(str(poses))
+        if not self.output_dir_var.get() and len(pcd_path.parents) >= 3:
+            candidate = pcd_path.parents[2] / '2d' / pcd_path.parent.name
+            self.output_dir_var.set(str(candidate))
+
+    def _preview_generate(self) -> None:
+        self._run_conversion(target_dir=self.preview_dir, is_preview=True)
+
+    def _save_generate(self) -> None:
+        output_dir = self.output_dir_var.get().strip()
+        if not output_dir:
+            messagebox.showerror('缺少输出目录', '请先选择输出目录。')
+            return
+        self._run_conversion(target_dir=Path(output_dir), is_preview=False)
+
+    def _save_current_map_to_output(self) -> None:
+        if self.current_pixels is None or self.current_yaml_text == '':
+            messagebox.showerror('没有地图', '请先生成或加载一张 2D 地图。')
+            return
+        output_dir = self.output_dir_var.get().strip()
+        if not output_dir:
+            messagebox.showerror('缺少输出目录', '请先选择输出目录。')
+            return
+
+        dst = Path(output_dir)
+        dst.mkdir(parents=True, exist_ok=True)
+        write_pgm(dst / 'map.pgm', self.current_pixels)
+        (dst / 'map.yaml').write_text(self.current_yaml_text, encoding='utf-8')
+        self._append_log(f'已保存当前编辑到 {dst}\n')
+        self.status_var.set(f'已保存当前编辑到 {dst}')
+        messagebox.showinfo('完成', f'已保存当前编辑到\n{dst}')
+
+    def _restore_original_map(self) -> None:
+        if self.original_pixels is None:
+            return
+        self.current_pixels = clone_pixels(self.original_pixels)
+        self.is_dirty = False
+        self._cancel_line_draw()
+        self._render_map(full_refresh=True)
+        self._update_preview_info()
+        self.status_var.set('已恢复到本次生成结果')
+
+    def _open_output_dir(self) -> None:
+        output_dir = self.output_dir_var.get().strip()
+        if not output_dir:
+            messagebox.showerror('缺少输出目录', '请先选择输出目录。')
+            return
+        path = Path(output_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        try:
+            if sys.platform.startswith('linux'):
+                subprocess.Popen(['xdg-open', str(path)])
+            elif sys.platform == 'darwin':
+                subprocess.Popen(['open', str(path)])
+            elif os.name == 'nt':
+                os.startfile(str(path))
+            else:
+                raise RuntimeError('当前平台不支持自动打开目录')
+        except Exception as exc:
+            messagebox.showerror('打开失败', str(exc))
+
+    def _run_conversion(self, target_dir: Path, is_preview: bool) -> None:
+        if self.running:
+            messagebox.showwarning('正在运行', '请等待当前任务完成。')
+            return
+
+        try:
+            cmd = self._build_command(target_dir)
+        except ValueError as exc:
+            messagebox.showerror('参数错误', str(exc))
+            return
+
+        self.running = True
+        self.preview_button.configure(state='disabled')
+        self.save_button.configure(state='disabled')
+        self.status_var.set('生成中...')
+
+        if is_preview and target_dir.exists():
+            shutil.rmtree(target_dir)
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        def worker() -> None:
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            self.root.after(0, lambda: self._finish_conversion(proc, target_dir, is_preview, cmd))
+
+        self.worker_thread = threading.Thread(target=worker, daemon=True)
+        self.worker_thread.start()
+
+    def _build_command(self, target_dir: Path) -> list[str]:
+        pcd_path = Path(self.pcd_path_var.get().strip())
+        if not pcd_path.is_file():
+            raise ValueError('PCD 文件不存在。')
+
+        cmd = [
+            str(self.converter_path),
+            '--pcd', str(pcd_path),
+            '--out-dir', str(target_dir),
+        ]
+
+        float_fields = [
+            'resolution', 'z_min', 'z_max', 'obstacle_z_min', 'obstacle_z_max',
+            'inflation_radius', 'padding', 'sor_stddev',
+        ]
+        int_fields = ['obstacle_min_hits', 'sor_mean_k', 'min_obstacle_cluster']
+
+        for key in float_fields:
+            value = self.param_vars[key].get().strip()
+            if value == '':
+                raise ValueError(f'参数 {key} 不能为空。')
+            float(value)
+        for key in int_fields:
+            value = self.param_vars[key].get().strip()
+            if value == '':
+                raise ValueError(f'参数 {key} 不能为空。')
+            int(value)
+
+        ordered_flags = [
+            ('resolution', '--resolution'),
+            ('z_min', '--z-min'),
+            ('z_max', '--z-max'),
+            ('obstacle_z_min', '--obstacle-z-min'),
+            ('obstacle_z_max', '--obstacle-z-max'),
+            ('inflation_radius', '--inflation-radius'),
+            ('padding', '--padding'),
+            ('obstacle_min_hits', '--obstacle-min-hits'),
+            ('sor_mean_k', '--sor-mean-k'),
+            ('sor_stddev', '--sor-stddev'),
+            ('min_obstacle_cluster', '--min-obstacle-cluster'),
+        ]
+        for key, flag in ordered_flags:
+            cmd.extend([flag, self.param_vars[key].get().strip()])
+
+        if self.use_poses_var.get():
+            poses_path = Path(self.poses_path_var.get().strip())
+            if not poses_path.is_file():
+                raise ValueError('已启用 poses 射线投影，但 poses.txt 不存在。')
+            cmd.extend(['--poses', str(poses_path)])
+
+        return cmd
+
+    def _finish_conversion(
+        self,
+        proc: subprocess.CompletedProcess[str],
+        target_dir: Path,
+        is_preview: bool,
+        cmd: list[str],
+    ) -> None:
+        self.running = False
+        self.preview_button.configure(state='normal')
+        self.save_button.configure(state='normal')
+
+        quoted_cmd = ' '.join(shlex.quote(token) for token in cmd)
+        self._append_log(f'$ {quoted_cmd}\n')
+        if proc.stdout:
+            self._append_log(proc.stdout)
+            if not proc.stdout.endswith('\n'):
+                self._append_log('\n')
+        if proc.stderr:
+            self._append_log(proc.stderr)
+            if not proc.stderr.endswith('\n'):
+                self._append_log('\n')
+
+        if proc.returncode != 0:
+            self.status_var.set('生成失败')
+            messagebox.showerror('生成失败', '转换器执行失败，请查看日志。')
+            return
+
+        image_path = target_dir / 'map.pgm'
+        yaml_path = target_dir / 'map.yaml'
+        if not image_path.is_file() or not yaml_path.is_file():
+            self.status_var.set('生成失败')
+            messagebox.showerror('生成失败', '输出目录里缺少 map.pgm 或 map.yaml。')
+            return
+
+        self._load_map(image_path, yaml_path)
+
+        if is_preview:
+            self.status_var.set(f'预览完成: {target_dir}')
+        else:
+            self.status_var.set(f'已生成并保存到 {target_dir}')
+            messagebox.showinfo('完成', f'已生成 2D 地图:\n{target_dir}')
+
+    def _load_map(self, image_path: Path, yaml_path: Path) -> None:
+        width, height, pixels = read_pgm(image_path)
+        self.current_width = width
+        self.current_height = height
+        self.current_pixels = pixels
+        self.original_pixels = clone_pixels(pixels)
+        self.current_image_path = image_path
+        self.current_yaml_path = yaml_path
+        self.current_yaml_text = yaml_path.read_text(encoding='utf-8')
+        self.is_dirty = False
+        self.last_paint_key = None
+        self._cancel_line_draw()
+
+        meta = self._parse_map_yaml(yaml_path)
+        self.current_resolution = None
+        self.current_origin = None
+        if 'resolution' in meta:
+            try:
+                self.current_resolution = float(meta['resolution'])
+            except ValueError:
+                self.current_resolution = None
+        if 'origin' in meta:
+            parsed = self._parse_origin(meta['origin'])
+            if parsed is not None:
+                self.current_origin = parsed
+
+        self._render_map(full_refresh=True)
+        self._set_edit_buttons_enabled(True)
+        self._update_preview_info()
+
+    def _render_map(self, full_refresh: bool, changed: list[tuple[int, int]] | None = None) -> None:
+        if self.current_pixels is None:
+            return
+
+        if full_refresh or self.base_photo is None or self.display_photo is None:
+            self.display_zoom, self.display_subsample = self._compute_display_transform(
+                self.current_width,
+                self.current_height,
+            )
+            self.base_photo = tk.PhotoImage(width=self.current_width, height=self.current_height)
+            for y, row in enumerate(self.current_pixels):
+                colors = ' '.join(pixel_to_color(value) for value in row)
+                self.base_photo.put('{' + colors + '}', to=(0, y))
+
+            if self.display_subsample > 1:
+                self.display_photo = self.base_photo.subsample(self.display_subsample)
+            elif self.display_zoom > 1:
+                self.display_photo = self.base_photo.zoom(self.display_zoom)
+            else:
+                self.display_photo = self.base_photo
+
+            display_width = self.display_photo.width()
+            display_height = self.display_photo.height()
+            self.preview_canvas.delete('all')
+            self.canvas_image_id = self.preview_canvas.create_image(
+                0, 0, anchor='nw', image=self.display_photo
+            )
+            self.preview_canvas.configure(
+                width=min(PREVIEW_MAX_SIZE, display_width),
+                height=min(PREVIEW_MAX_SIZE, display_height),
+                scrollregion=(0, 0, display_width, display_height),
+                cursor='crosshair',
+            )
+            return
+
+        if not changed:
+            return
+
+        if self.display_subsample > 1:
+            self._render_map(full_refresh=True)
+            return
+
+        for gx, gy in changed:
+            color = pixel_to_color(self.current_pixels[gy][gx])
+            self.base_photo.put(color, to=(gx, gy))
+            if self.display_zoom > 1 and self.display_photo is not None:
+                x0 = gx * self.display_zoom
+                y0 = gy * self.display_zoom
+                x1 = x0 + self.display_zoom
+                y1 = y0 + self.display_zoom
+                self.display_photo.put(color, to=(x0, y0, x1, y1))
+
+    def _compute_display_transform(self, width: int, height: int) -> tuple[int, int]:
+        max_dim = max(width, height)
+        if max_dim <= PREVIEW_MAX_SIZE:
+            zoom = max(1, min(PREVIEW_ZOOM_CAP, PREVIEW_MAX_SIZE // max_dim))
+            return zoom, 1
+        return 1, max(1, math.ceil(max_dim / PREVIEW_MAX_SIZE))
+
+    def _parse_map_yaml(self, yaml_path: Path) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for line in yaml_path.read_text(encoding='utf-8').splitlines():
+            if ':' not in line:
+                continue
+            key, value = line.split(':', 1)
+            result[key.strip()] = value.strip()
+        return result
+
+    def _parse_origin(self, raw: str) -> tuple[float, float, float] | None:
+        text = raw.strip()
+        if not (text.startswith('[') and text.endswith(']')):
+            return None
+        pieces = [part.strip() for part in text[1:-1].split(',')]
+        if len(pieces) != 3:
+            return None
+        try:
+            return float(pieces[0]), float(pieces[1]), float(pieces[2])
+        except ValueError:
+            return None
+
+    def _get_brush_radius(self) -> int:
+        raw = self.brush_radius_var.get().strip()
+        if raw == '':
+            return 0
+        try:
+            value = int(raw)
+        except ValueError:
+            digits = ''.join(ch for ch in raw if ch.isdigit())
+            if digits == '':
+                return 0
+            value = int(digits)
+        return max(0, min(50, value))
+
+    def _normalize_brush_radius(self, event=None) -> None:
+        normalized = str(self._get_brush_radius())
+        if self.brush_radius_var.get() != normalized:
+            self.brush_radius_var.set(normalized)
+        else:
+            self._on_edit_settings_change()
+
+    def _step_brush_radius(self, delta: int) -> None:
+        value = max(0, min(50, self._get_brush_radius() + delta))
+        self.brush_radius_var.set(str(value))
+
+    def _update_preview_info(self) -> None:
+        if self.current_pixels is None or self.current_image_path is None:
+            self.preview_info_var.set('还没有预览。')
+            return
+
+        state = '已修改' if self.is_dirty else '未修改'
+        resolution = self.current_resolution if self.current_resolution is not None else 'unknown'
+        origin = self.current_origin if self.current_origin is not None else 'unknown'
+        self.preview_info_var.set(
+            '图像: {name}\n'
+            '尺寸: {width} x {height} px\n'
+            '分辨率: {resolution} m/cell\n'
+            '原点: {origin}\n'
+            '编辑状态: {state}\n'
+            '当前工具: {tool}\n'
+            '当前刷子: {brush} / 半径 {radius}'.format(
+                name=self.current_image_path,
+                width=self.current_width,
+                height=self.current_height,
+                resolution=resolution,
+                origin=origin,
+                state=state,
+                tool=TOOL_TO_LABEL[self.draw_tool_var.get()],
+                brush=MODE_TO_LABEL[self.edit_mode_var.get()],
+                radius=self._get_brush_radius(),
+            )
+        )
+
+    def _on_edit_settings_change(self, *args) -> None:
+        if self.draw_tool_var.get() != 'line':
+            self._cancel_line_draw()
+        elif self.line_start_cell is not None:
+            self._update_line_preview(self.line_start_cell)
+        self._update_preview_info()
+
+    def _set_edit_buttons_enabled(self, enabled: bool) -> None:
+        state = 'normal' if enabled else 'disabled'
+        self.save_edit_button.configure(state=state)
+        self.restore_button.configure(state=state)
+
+    def _on_paint_start(self, event) -> None:
+        if self.draw_tool_var.get() == 'line':
+            self._apply_line_click(event)
+            return
+        self.last_paint_key = None
+        self._paint_from_event(event)
+
+    def _on_paint_drag(self, event) -> None:
+        if self.draw_tool_var.get() != 'brush':
+            return
+        self._paint_from_event(event)
+
+    def _on_paint_end(self, event) -> None:
+        if self.draw_tool_var.get() == 'brush':
+            self.last_paint_key = None
+
+    def _on_cancel_line(self, event=None) -> None:
+        if self.draw_tool_var.get() != 'line':
+            return
+        self._cancel_line_draw(update_status=True)
+
+    def _paint_from_event(self, event) -> None:
+        if self.current_pixels is None or self.running:
+            return
+        cell = self._canvas_to_grid(event.x, event.y)
+        if cell is None:
+            return
+        gx, gy = cell
+        radius = self._get_brush_radius()
+        mode = self.edit_mode_var.get()
+        key = (gx, gy, radius, mode)
+        if key == self.last_paint_key:
+            return
+        self.last_paint_key = key
+
+        changed = self._apply_brush(gx, gy, radius, mode)
+        if changed:
+            self.is_dirty = True
+            self._render_map(full_refresh=False, changed=changed)
+            self._update_preview_info()
+
+    def _apply_line_click(self, event) -> None:
+        if self.current_pixels is None or self.running:
+            return
+        cell = self._canvas_to_grid(event.x, event.y)
+        if cell is None:
+            return
+        if self.line_start_cell is None:
+            self.line_start_cell = cell
+            self.last_paint_key = None
+            self._update_line_preview(cell)
+            gx, gy = cell
+            self.status_var.set(
+                f'直线起点已设置: ({gx}, {gy})，移动鼠标预览，左键再次点击完成，右键取消'
+            )
+            return
+
+        radius = self._get_brush_radius()
+        mode = self.edit_mode_var.get()
+        changed = self._apply_line(self.line_start_cell, cell, radius, mode)
+        self._cancel_line_draw()
+        if changed:
+            self.is_dirty = True
+            self._render_map(full_refresh=False, changed=changed)
+            self._update_preview_info()
+            self.status_var.set(f'已绘制直线: {MODE_TO_LABEL[mode]} / 半径 {radius}')
+        else:
+            self.status_var.set('直线未产生新的修改')
+
+    def _apply_brush(self, gx: int, gy: int, radius: int, mode: str) -> list[tuple[int, int]]:
+        if self.current_pixels is None:
+            return []
+        target = MODE_TO_PIXEL[mode]
+        changed: list[tuple[int, int]] = []
+        x_min = max(0, gx - radius)
+        x_max = min(self.current_width - 1, gx + radius)
+        y_min = max(0, gy - radius)
+        y_max = min(self.current_height - 1, gy + radius)
+        radius_sq = radius * radius
+
+        for py in range(y_min, y_max + 1):
+            for px in range(x_min, x_max + 1):
+                if radius > 0 and (px - gx) * (px - gx) + (py - gy) * (py - gy) > radius_sq:
+                    continue
+                if self.current_pixels[py][px] == target:
+                    continue
+                self.current_pixels[py][px] = target
+                changed.append((px, py))
+        return changed
+
+    def _apply_line(
+        self,
+        start: tuple[int, int],
+        end: tuple[int, int],
+        radius: int,
+        mode: str,
+    ) -> list[tuple[int, int]]:
+        changed: list[tuple[int, int]] = []
+        for gx, gy in self._iter_line_cells(start[0], start[1], end[0], end[1]):
+            changed.extend(self._apply_brush(gx, gy, radius, mode))
+        return changed
+
+    def _iter_line_cells(self, x0: int, y0: int, x1: int, y1: int) -> list[tuple[int, int]]:
+        cells: list[tuple[int, int]] = []
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx - dy
+
+        while True:
+            cells.append((x0, y0))
+            if x0 == x1 and y0 == y1:
+                break
+            step = err * 2
+            if step > -dy:
+                err -= dy
+                x0 += sx
+            if step < dx:
+                err += dx
+                y0 += sy
+        return cells
+
+    def _clear_line_preview(self) -> None:
+        if self.preview_line_id is not None:
+            self.preview_canvas.delete(self.preview_line_id)
+            self.preview_line_id = None
+
+    def _cancel_line_draw(self, update_status: bool = False) -> None:
+        had_pending = self.line_start_cell is not None or self.preview_line_id is not None
+        self.line_start_cell = None
+        self.last_paint_key = None
+        self._clear_line_preview()
+        if update_status and had_pending:
+            self.status_var.set('已取消直线绘制')
+
+    def _grid_to_canvas(self, gx: int, gy: int) -> tuple[float, float]:
+        if self.display_subsample > 1:
+            return (gx + 0.5) / self.display_subsample, (gy + 0.5) / self.display_subsample
+        scale = max(1, self.display_zoom)
+        return (gx + 0.5) * scale, (gy + 0.5) * scale
+
+    def _update_line_preview(self, cell: tuple[int, int] | None) -> None:
+        if self.draw_tool_var.get() != 'line' or self.line_start_cell is None or cell is None:
+            self._clear_line_preview()
+            return
+
+        x0, y0 = self._grid_to_canvas(*self.line_start_cell)
+        x1, y1 = self._grid_to_canvas(*cell)
+        radius = self._get_brush_radius()
+        if self.display_subsample > 1:
+            scale = 1.0 / self.display_subsample
+        else:
+            scale = float(max(1, self.display_zoom))
+        width = max(1, int(round((2 * radius + 1) * scale)))
+        color = MODE_TO_COLOR[self.edit_mode_var.get()]
+
+        if self.preview_line_id is None:
+            self.preview_line_id = self.preview_canvas.create_line(
+                x0, y0, x1, y1,
+                fill=color,
+                width=width,
+                dash=(6, 4),
+                capstyle=tk.ROUND,
+            )
+        else:
+            self.preview_canvas.coords(self.preview_line_id, x0, y0, x1, y1)
+            self.preview_canvas.itemconfigure(self.preview_line_id, fill=color, width=width)
+
+    def _canvas_to_grid(self, x: int, y: int) -> tuple[int, int] | None:
+        if self.current_pixels is None:
+            return None
+        if x < 0 or y < 0:
+            return None
+        if self.display_subsample > 1:
+            gx = x * self.display_subsample
+            gy = y * self.display_subsample
+        else:
+            gx = x // self.display_zoom
+            gy = y // self.display_zoom
+        if 0 <= gx < self.current_width and 0 <= gy < self.current_height:
+            return int(gx), int(gy)
+        return None
+
+    def _grid_to_world(self, gx: int, gy: int) -> tuple[float, float] | None:
+        if self.current_origin is None or self.current_resolution is None:
+            return None
+        origin_x, origin_y, _ = self.current_origin
+        wx = origin_x + (gx + 0.5) * self.current_resolution
+        wy = origin_y + (self.current_height - gy - 0.5) * self.current_resolution
+        return wx, wy
+
+    def _on_canvas_motion(self, event) -> None:
+        cell = self._canvas_to_grid(event.x, event.y)
+        if cell is None or self.current_pixels is None:
+            self.cursor_info_var.set('光标: -')
+            if self.line_start_cell is not None:
+                self._clear_line_preview()
+            return
+        gx, gy = cell
+        value = self.current_pixels[gy][gx]
+        mode = MODE_TO_LABEL[pixel_to_mode(value)]
+        world = self._grid_to_world(gx, gy)
+        if world is None:
+            self.cursor_info_var.set(f'光标: 栅格 ({gx}, {gy}) | 值 {value} ({mode})')
+        else:
+            wx, wy = world
+            self.cursor_info_var.set(
+                f'光标: 栅格 ({gx}, {gy}) | 世界 ({wx:.2f}, {wy:.2f}) | 值 {value} ({mode})'
+            )
+        if self.draw_tool_var.get() == 'line' and self.line_start_cell is not None:
+            self._update_line_preview(cell)
+
+    def _on_canvas_leave(self, event) -> None:
+        self.cursor_info_var.set('光标: -')
+        if self.line_start_cell is not None:
+            self._clear_line_preview()
+
+    def _clear_log(self) -> None:
+        self.log_text.configure(state='normal')
+        self.log_text.delete('1.0', 'end')
+        self.log_text.configure(state='disabled')
+
+    def _append_log(self, text: str) -> None:
+        self.log_text.configure(state='normal')
+        self.log_text.insert('end', text)
+        self.log_text.see('end')
+        self.log_text.configure(state='disabled')
+
+    def _on_close(self) -> None:
+        try:
+            shutil.rmtree(self.preview_root, ignore_errors=True)
+        finally:
+            self.root.destroy()
+
+
+def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == '--help':
+        print('运行方式: ros2 run pgo pcd_to_nav2_map_gui')
+        print('这是一个图形界面前端，用于调用 pcd_to_nav2_map 生成 2D 地图并直接修图。')
+        return 0
+
+    root = tk.Tk()
+    style = ttk.Style(root)
+    if 'clam' in style.theme_names():
+        style.theme_use('clam')
+
+    try:
+        MapConverterGui(root)
+    except Exception as exc:
+        root.withdraw()
+        messagebox.showerror('启动失败', str(exc))
+        return 1
+
+    root.mainloop()
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
